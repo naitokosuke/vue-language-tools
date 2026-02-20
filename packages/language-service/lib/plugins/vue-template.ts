@@ -272,6 +272,10 @@ export function create(
 						htmlCompletion.isIncomplete = true;
 					}
 
+					if (htmlCompletion.items[0]?.kind === 12 satisfies typeof CompletionItemKind.Value) {
+						addDirectiveModifiers(htmlCompletion, htmlCompletion.items[0], document);
+					}
+
 					await resolveAutoImportPlaceholder(htmlCompletion, info);
 					resolveComponentItemKinds(htmlCompletion);
 
@@ -336,8 +340,6 @@ export function create(
 									}
 									break;
 								case 12 satisfies typeof CompletionItemKind.Value:
-									addDirectiveModifiers(htmlCompletion, item, document);
-
 									if (
 										typeof item.documentation === 'object' && item.documentation.value.includes('*@deprecated*')
 									) {
@@ -594,6 +596,22 @@ export function create(
 						}
 					}
 				},
+
+				provideDocumentSymbols(document, token) {
+					if (document.languageId !== languageId) {
+						return;
+					}
+					const info = resolveEmbeddedCode(context, document.uri);
+					if (info?.code.id !== 'template') {
+						return;
+					}
+
+					updateExtraCustomData([
+						html.getDefaultHTMLDataProvider(),
+					]);
+
+					return baseServiceInstance.provideDocumentSymbols?.(document, token);
+				},
 			};
 
 			async function runWithVueDataProvider<T>(
@@ -763,6 +781,8 @@ export function create(
 										const name = attrNameCasing === AttrNameCasing.Camel ? prop.name : hyphenateAttr(prop.name);
 										return name === labelName;
 									});
+									const isBoolean = propMeta2?.type === 'boolean' || propMeta2?.type.startsWith('boolean ');
+
 									if (addPlainAttrs) {
 										attributes.push({
 											name: labelName,
@@ -773,12 +793,14 @@ export function create(
 										attributes.push({
 											name: V_BIND_SHORTHAND + labelName,
 											description: propMeta2 && createDescription(propMeta2),
+											valueSet: isBoolean ? 'v' : undefined,
 										});
 									}
 									if (addVBinds) {
 										attributes.push({
 											name: DIRECTIVE_V_BIND + labelName,
 											description: propMeta2 && createDescription(propMeta2),
+											valueSet: isBoolean ? 'v' : undefined,
 										});
 									}
 								}

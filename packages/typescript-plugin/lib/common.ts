@@ -5,8 +5,14 @@ import {
 	toSourceRanges,
 } from '@volar/typescript/lib/node/transform';
 import { getServiceScript } from '@volar/typescript/lib/node/utils';
-import { type Language, type VueCodeInformation, type VueCompilerOptions, VueVirtualCode } from '@vue/language-core';
-import { capitalize, isGloballyAllowed } from '@vue/shared';
+import {
+	type Language,
+	tsCodegen,
+	type VueCodeInformation,
+	type VueCompilerOptions,
+	VueVirtualCode,
+} from '@vue/language-core';
+import { camelize, capitalize, isGloballyAllowed } from '@vue/shared';
 import type * as ts from 'typescript';
 
 const windowsPathReg = /\\/g;
@@ -20,42 +26,51 @@ export function preprocessLanguageService(
 		getSuggestionDiagnostics,
 		getCompletionsAtPosition,
 		getCodeFixesAtPosition,
+		findRenameLocations,
 	} = languageService;
 
 	languageService.getQuickInfoAtPosition = (fileName, position, ...rests) => {
 		const result = getQuickInfoAtPosition(fileName, position, ...rests);
-		if (!result) {
+		if (!result || result.tags?.length) {
 			return result;
 		}
 		const language = getLanguage();
 		if (!language) {
 			return result;
 		}
-		const [serviceScript, _targetScript, sourceScript] = getServiceScript(language, fileName);
+		const [serviceScript, , sourceScript] = getServiceScript(language, fileName);
 		if (!serviceScript || !(sourceScript?.generated?.root instanceof VueVirtualCode)) {
 			return result;
 		}
+		const codegen = tsCodegen.get(sourceScript.generated.root.sfc);
+		const leadingOffset = sourceScript.snapshot.getLength();
 		for (
-			const sourceOffset of toSourceOffsets(
+			const sourceRange of toSourceRanges(
 				sourceScript,
 				language,
 				serviceScript,
-				position,
+				result.textSpan.start,
+				result.textSpan.start + result.textSpan.length,
+				true,
 				() => true,
 			)
 		) {
-			const generatedOffset2 = toGeneratedOffset(
+			const generateRange2 = toGeneratedRange(
 				language,
 				serviceScript,
 				sourceScript,
-				sourceOffset[1],
+				sourceRange[1],
+				sourceRange[2],
 				(data: VueCodeInformation) => !!data.__importCompletion,
 			);
-			if (generatedOffset2 !== undefined) {
-				const extraInfo = getQuickInfoAtPosition(fileName, generatedOffset2, ...rests);
-				if (extraInfo) {
-					result.tags ??= [];
-					result.tags.push(...extraInfo.tags ?? []);
+			if (generateRange2 !== undefined) {
+				const variableName = serviceScript.code.snapshot.getText(
+					generateRange2[0] - leadingOffset,
+					generateRange2[1] - leadingOffset,
+				);
+				if (codegen?.getSetupExposed().has(variableName)) {
+					const extraInfo = getQuickInfoAtPosition(fileName, generateRange2[0], ...rests);
+					result.tags = extraInfo?.tags;
 				}
 			}
 		}
@@ -67,10 +82,12 @@ export function preprocessLanguageService(
 		if (!language) {
 			return result;
 		}
-		const [serviceScript, _targetScript, sourceScript] = getServiceScript(language, fileName);
+		const [serviceScript, , sourceScript] = getServiceScript(language, fileName);
 		if (!serviceScript || !(sourceScript?.generated?.root instanceof VueVirtualCode)) {
 			return result;
 		}
+		const codegen = tsCodegen.get(sourceScript.generated.root.sfc);
+		const leadingOffset = sourceScript.snapshot.getLength();
 		for (const diagnostic of result) {
 			for (
 				const sourceRange of toSourceRanges(
@@ -92,9 +109,15 @@ export function preprocessLanguageService(
 					(data: VueCodeInformation) => !data.__importCompletion,
 				);
 				if (generateRange2 !== undefined) {
-					diagnostic.start = generateRange2[0];
-					diagnostic.length = generateRange2[1] - generateRange2[0];
-					break;
+					const variableName = serviceScript.code.snapshot.getText(
+						generateRange2[0] - leadingOffset,
+						generateRange2[1] - leadingOffset,
+					);
+					if (codegen?.getSetupExposed().has(variableName)) {
+						diagnostic.start = generateRange2[0];
+						diagnostic.length = generateRange2[1] - generateRange2[0];
+						break;
+					}
 				}
 			}
 		}
@@ -200,6 +223,117 @@ export function preprocessLanguageService(
 		}
 		return result;
 	};
+
+	languageService.findRenameLocations = (fileName, position, ...rests) => {
+		// @ts-expect-error
+		const result = findRenameLocations(fileName, position, ...rests);
+		if (!result?.length) {
+			return result;
+		}
+
+		const language = getLanguage();
+		if (!language) {
+			return result;
+		}
+
+		const [serviceScript, _targetScript, sourceScript] = getServiceScript(language, fileName);
+		if (!serviceScript || !(sourceScript?.generated?.root instanceof VueVirtualCode)) {
+			return result;
+		}
+
+		const map = language.maps.get(serviceScript.code, sourceScript);
+		const leadingOffset = sourceScript.snapshot.getLength();
+		const isShorthand = (data: VueCodeInformation) => !!data.__shorthandExpression;
+
+		// { foo: __VLS_ctx.foo }
+		//   ^^^            ^^^
+		// if the rename is triggered directly on the shorthand,
+		// skip the entire request on the generated property name
+		if ([...map.toSourceLocation(position - leadingOffset, isShorthand)].length === 0) {
+			for (const [offset] of map.toSourceLocation(position - leadingOffset, () => true)) {
+				for (const _ of map.toGeneratedLocation(offset, isShorthand)) {
+					return;
+				}
+			}
+		}
+
+		const preferAlias = typeof rests[2] === 'boolean'
+			? rests[2]
+			: rests[2]?.providePrefixAndSuffixTextForRename ?? true;
+		if (!preferAlias) {
+			return result;
+		}
+
+		const locations = [...result];
+		outer: for (let i = 0; i < locations.length; i++) {
+			const { textSpan } = locations[i]!;
+			const generatedLeft = textSpan.start - leadingOffset;
+			const generatedRight = textSpan.start + textSpan.length - leadingOffset;
+
+			// { foo: __VLS_ctx.foo }
+			//                  ^^^
+			for (const [start, end, { data }] of map.toSourceRange(generatedLeft, generatedRight, true, isShorthand)) {
+				locations.splice(i, 1, {
+					...locations[i]!,
+					...getPrefixAndSuffixForShorthandRename(
+						(data as VueCodeInformation).__shorthandExpression!,
+						'right',
+						sourceScript.snapshot.getText(start, end),
+					),
+				});
+				continue outer;
+			}
+
+			// { foo: __VLS_ctx.foo }
+			//   ^^^
+			for (const [start, end] of map.toSourceRange(generatedLeft, generatedRight, true, () => true)) {
+				for (const [, , { data }] of map.toGeneratedRange(start, end, true, isShorthand)) {
+					locations.splice(i, 1, {
+						...locations[i]!,
+						...getPrefixAndSuffixForShorthandRename(
+							(data as VueCodeInformation).__shorthandExpression!,
+							'left',
+							sourceScript.snapshot.getText(start, end),
+						),
+					});
+					continue outer;
+				}
+			}
+		}
+		return locations;
+	};
+}
+
+function getPrefixAndSuffixForShorthandRename(
+	type: 'html' | 'js',
+	target: 'left' | 'right',
+	originalText: string,
+): Pick<ts.RenameLocation, 'prefixText' | 'suffixText'> {
+	if (type === 'html') {
+		if (target === 'left') {
+			return {
+				suffixText: `="${camelize(originalText)}"`,
+			};
+		}
+		else {
+			return {
+				prefixText: `${originalText}="`,
+				suffixText: `"`,
+			};
+		}
+	}
+	else {
+		if (target === 'left') {
+			return {
+				suffixText: `: ${originalText}`,
+			};
+		}
+		else {
+			return {
+				prefixText: `${originalText}: `,
+			};
+		}
+	}
 }
 
 export function postprocessLanguageService<T>(
